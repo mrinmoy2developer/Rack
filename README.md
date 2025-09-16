@@ -27,3 +27,24 @@ Compression is handled using [zstd](https://facebook.github.io/zstd/) with suppo
 git clone https://github.com/yourusername/rack.git
 cd rack
 pip install -r requirements.txt
+chmod +x rack.py
+# ln -s $(pwd)/rack.py /usr/local/bin/rack
+```
+##Usage 
+
+## Commands
+  -- add <input_dir> -m “”
+Store a snapshot of a folder with a commit message.
+Flags:
+	•	-o <output_dir> → specify custom repo location (default: <input_dir>/.rack/)
+	•	-rm → remove contents of <input_dir> after storing
+	•	-p → show progress bar during storage
+	•	info <hash>
+Show metadata about a specific commit (author, time, size, files).
+	•	**dump <hash> -o <output_dir>**   Extract a commit into a directory.   If -ois not provided, dumps into<input_dir>/`.
+Shows a progress bar during extraction.
+	•	list
+Display all stored commits with details.
+	•	burn […]
+Delete commits by hash.
+Without arguments, deletes the entire repository (with confirmation).
