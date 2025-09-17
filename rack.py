@@ -20,7 +20,7 @@ import json
 import tarfile
 import fnmatch
 import shutil
-import tempfile
+import tempfile, select
 from datetime import datetime
 
 # optional import check
@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "exclude": ["*.tmp", "./debug/*"],
     "preserve_structure": True,
     "compress_mode": "files",   # "files" or "folder"
-    "zstd_level": 17
+    "zstd_level": 3
 }
 
 # ---------- helpers ----------
@@ -111,12 +111,14 @@ def hash_commit(msg, tags):
 def compress_file(src, dst, level):
     cctx = zstd.ZstdCompressor(level=level)
     with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        fdst.write(cctx.compress(fsrc.read()))
+        with cctx.stream_writer(fdst) as compressor:
+            shutil.copyfileobj(fsrc, compressor, length=1024*1024)  # 1MB chunks
 
 def decompress_file(src, dst):
     dctx = zstd.ZstdDecompressor()
     with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        fdst.write(dctx.decompress(fsrc.read()))
+        with dctx.stream_reader(fsrc) as reader:
+            shutil.copyfileobj(reader, fdst, length=1024*1024)
 
 def status_bar(cur, total, prefix=""):
     width = 30
@@ -132,169 +134,139 @@ def status_bar(cur, total, prefix=""):
         print()
 
 # ---------- core commands ----------
-def store(msg, tags, override_path=None, remove=False):
-    root = require_rack_root()
-    _, _, store_dir, _ = get_paths(root)
-    cfg = load_config(root)
+def check_abort():
+    """Return True if user pressed 'q' (kill switch)."""
+    if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+        ch=sys.stdin.read(1)
+        if ch.lower()=="q": return True
+    return False
 
-    logs_dir = os.path.abspath(override_path) if override_path else os.path.join(root, cfg["input_dir"])
-    if not os.path.isdir(logs_dir):
-        sys.exit(f"❌ Error: input directory not found: {logs_dir}")
+# ---------- core ----------
+def store(msg,tags,override_path=None,remove=False):
+    root=require_rack_root()
+    _,_,store_dir,_=get_paths(root)
+    cfg=load_config(root)
+    logs_dir=os.path.abspath(override_path) if override_path else os.path.join(root,cfg["input_dir"])
+    if not os.path.isdir(logs_dir): sys.exit(f"❌ Error: input dir not found: {logs_dir}")
 
-    index = load_index(root)
-    commit_hash = hash_commit(msg, tags)
-    if commit_hash in index:
-        sys.exit(f"❌ Error: duplicate commit detected with hash {commit_hash}")
+    index=load_index(root)
+    h=hash_commit(msg,tags)
+    if h in index: sys.exit(f"❌ Error: duplicate commit detected {h}")
 
-    commit_dir = os.path.join(store_dir, commit_hash)
-    os.makedirs(commit_dir, exist_ok=True)
+    tmp_commit_dir=os.path.join(store_dir,"_"+h)
+    final_commit_dir=os.path.join(store_dir,h)
+    if os.path.exists(tmp_commit_dir) or os.path.exists(final_commit_dir):
+        sys.exit(f"❌ Error: commit directory for {h} already exists")
 
-    # gather files respecting exclude
-    files = []
-    for walk_root, _, fnames in os.walk(logs_dir):
-        for fname in fnames:
-            rel = os.path.relpath(os.path.join(walk_root, fname), logs_dir)
-            if any(fnmatch.fnmatch(rel, pat) for pat in cfg.get("exclude", [])):
-                continue
-            files.append((walk_root, fname))
+    os.makedirs(tmp_commit_dir,exist_ok=True)
 
-    total_size = 0
-    count = len(files)
+    files=[]; 
+    for wr,_,fns in os.walk(logs_dir):
+        for fn in fns:
+            rel=os.path.relpath(os.path.join(wr,fn),logs_dir)
+            if any(fnmatch.fnmatch(rel,pat) for pat in cfg.get("exclude",[])): continue
+            files.append((wr,fn))
 
-    if cfg.get("compress_mode", "files") == "folder":
-        tar_path = os.path.join(commit_dir, "logs.tar")
-        with tarfile.open(tar_path, "w") as tar:
-            for i, (walk_root, fname) in enumerate(files, 1):
-                rel = os.path.relpath(os.path.join(walk_root, fname), logs_dir)
-                arcname = rel if cfg.get("preserve_structure", True) else fname
-                tar.add(os.path.join(walk_root, fname), arcname=arcname)
-                status_bar(i, count, prefix="📦 Packing")
-        # compress tar
-        level = cfg.get("zstd_level", 17)
-        with open(tar_path, "rb") as fsrc, open(tar_path + ".zst", "wb") as fdst:
-            fdst.write(zstd.ZstdCompressor(level=level).compress(fsrc.read()))
-        total_size = os.path.getsize(tar_path + ".zst")
-        os.remove(tar_path)
+    total_size=0; count=len(files)
+    try:
+        if cfg.get("compress_mode","files")=="folder":
+            tar_path=os.path.join(tmp_commit_dir,"logs.tar")
+            with tarfile.open(tar_path,"w") as tar:
+                for i,(wr,fn) in enumerate(files,1):
+                    if check_abort(): raise KeyboardInterrupt
+                    rel=os.path.relpath(os.path.join(wr,fn),logs_dir)
+                    arc=rel if cfg.get("preserve_structure",True) else fn
+                    tar.add(os.path.join(wr,fn),arcname=arc)
+                    status_bar(i,count,prefix="📦 Packing")
+            # compress tar
+            lvl=cfg.get("zstd_level",3)
+            with open(tar_path,"rb") as fsrc, open(tar_path+".zst","wb") as fdst:
+                fdst.write(zstd.ZstdCompressor(level=lvl).compress(fsrc.read()))
+            total_size=os.path.getsize(tar_path+".zst"); os.remove(tar_path)
+        else: # files
+            lvl=cfg.get("zstd_level",3)
+            for i,(wr,fn) in enumerate(files,1):
+                if check_abort(): raise KeyboardInterrupt
+                rel=os.path.relpath(os.path.join(wr,fn),logs_dir)
+                dst=os.path.join(tmp_commit_dir,rel+".zst") if cfg.get("preserve_structure",True) else os.path.join(tmp_commit_dir,fn+".zst")
+                os.makedirs(os.path.dirname(dst),exist_ok=True)
+                compress_file(os.path.join(wr,fn),dst,lvl)
+                total_size+=os.path.getsize(dst)
+                status_bar(i,count,prefix="📦 Compressing")
 
-    elif cfg.get("compress_mode", "files") == "files":
-        level = cfg.get("zstd_level", 17)
-        for i, (walk_root, fname) in enumerate(files, 1):
-            rel = os.path.relpath(os.path.join(walk_root, fname), logs_dir)
-            dst = os.path.join(commit_dir, rel + ".zst") if cfg.get("preserve_structure", True) else os.path.join(commit_dir, fname + ".zst")
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            compress_file(os.path.join(walk_root, fname), dst, level)
-            total_size += os.path.getsize(dst)
-            status_bar(i, count, prefix="📦 Compressing")
-    else:
-        sys.exit("❌ Error: invalid compress_mode in config (must be 'files' or 'folder')")
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rel_input=os.path.relpath(logs_dir,root)
+        index[h]={"msg":msg,"date":now,"size_bytes":total_size,"files":count,
+                  "path":os.path.relpath(final_commit_dir,root),"input_dir":rel_input,"tags":tags}
+        save_index(root,index)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rel_input_dir = os.path.relpath(logs_dir, root)
-    index[commit_hash] = {
-        "msg": msg,
-        "date": now,
-        "size_bytes": total_size,
-        "files": count,
-        "path": os.path.relpath(commit_dir, root),
-        "input_dir": rel_input_dir,
-        "tags": tags
-    }
-    save_index(root, index)
+        shutil.move(tmp_commit_dir,final_commit_dir)
+        tags_str=", ".join(f"{k}={v}" for k,v in tags.items())
+        print(f"✅ Stored {h} | {now} | {human_size(total_size)} | {count} files | {msg} | {tags_str}")
 
-    tags_str = ", ".join(f"{k}={v}" for k, v in tags.items()) if tags else ""
-    print(f"✅ Stored {commit_hash} | {now} | {human_size(total_size)} | {count} files | {msg} | {tags_str}")
-
-    if remove:
-        try:
-            # remove contents but keep folder (per your request)
-            for fname in os.listdir(logs_dir):
-                fpath = os.path.join(logs_dir, fname)
-                if os.path.isdir(fpath):
-                    shutil.rmtree(fpath)
-                else:
-                    os.remove(fpath)
+        if remove:
+            for fn in os.listdir(logs_dir):
+                fp=os.path.join(logs_dir,fn)
+                shutil.rmtree(fp) if os.path.isdir(fp) else os.remove(fp)
             print(f"🗑️ Cleared contents of {logs_dir}")
-        except Exception as e:
-            print(f"⚠️  Could not clear source dir: {e}")
+    except KeyboardInterrupt:
+        shutil.rmtree(tmp_commit_dir,ignore_errors=True)
+        print("\n❌ Aborted by user (q pressed). Cleaned up temp data.")
+    except Exception as e:
+        shutil.rmtree(tmp_commit_dir,ignore_errors=True)
+        raise e
 
-def dump(commit_hash, outdir=None, remove=False):
-    root = require_rack_root()
-    _, _, store_dir, _ = get_paths(root)
-    cfg = load_config(root)
-    index = load_index(root)
+def dump(commit_hash,outdir=None,remove=False):
+    root=require_rack_root(); _,_,store_dir,_=get_paths(root)
+    cfg=load_config(root); index=load_index(root)
+    if commit_hash not in index: sys.exit(f"❌ Error: commit {commit_hash} not found")
+    commit_dir=os.path.join(store_dir,commit_hash)
+    if not os.path.isdir(commit_dir): sys.exit(f"❌ Error: commit dir missing {commit_hash}")
 
-    if commit_hash not in index:
-        sys.exit(f"❌ Error: commit {commit_hash} not found")
+    outdir=outdir or os.path.join(root,index[commit_hash].get("input_dir",cfg.get("input_dir")))
+    outdir=os.path.abspath(outdir); os.makedirs(outdir,exist_ok=True)
 
-    commit_dir = os.path.join(store_dir, commit_hash)
-    if not os.path.isdir(commit_dir):
-        sys.exit(f"❌ Error: commit data missing for {commit_hash}")
-
-    # default outdir -> original input_dir recorded during store
-    if outdir is None:
-        recorded = index[commit_hash].get("input_dir", cfg.get("input_dir"))
-        outdir = os.path.join(root, recorded)
-    outdir = os.path.abspath(outdir)
-    os.makedirs(outdir, exist_ok=True)
-
-    # decide mode by checking if folder-mode tar exists, otherwise treat as files
-    tar_zst_path = os.path.join(commit_dir, "logs.tar.zst")
-    files_extracted = []
-    if os.path.isfile(tar_zst_path):
-        # folder mode
-        with tempfile.NamedTemporaryFile(delete=False) as tmpf:
-            tmp_tar = tmpf.name
-        try:
-            print("📦 Decompressing archive...")
-            with open(tar_zst_path, "rb") as fsrc, open(tmp_tar, "wb") as fdst:
+    files_extracted=[]
+    try:
+        tar_zst=os.path.join(commit_dir,"logs.tar.zst")
+        if os.path.isfile(tar_zst):
+            with tempfile.NamedTemporaryFile(delete=False) as tmp: tmp_tar=tmp.name
+            with open(tar_zst,"rb") as fsrc, open(tmp_tar,"wb") as fdst:
                 fdst.write(zstd.ZstdDecompressor().decompress(fsrc.read()))
-            with tarfile.open(tmp_tar, "r") as tar:
-                members = [m for m in tar.getmembers() if m.isreg() or m.isdir() or m.issym()]
-                total = len(members)
-                for i, member in enumerate(members, 1):
-                    tar.extract(member, path=outdir)
-                    if member.isreg():
-                        files_extracted.append(member.name)
-                    status_bar(i, total, prefix="📤 Extracting")
-        finally:
-            try:
-                os.remove(tmp_tar)
-            except Exception:
-                pass
-    else:
-        # files mode: iterate .zst files
-        zst_files = []
-        for walk_root, _, fnames in os.walk(commit_dir):
-            for fname in fnames:
-                if not fname.endswith(".zst"):
-                    continue
-                zst_files.append(os.path.join(walk_root, fname))
-        total = len(zst_files)
-        for i, src in enumerate(zst_files, 1):
-            rel = os.path.relpath(src, commit_dir)
-            rel_no_ext = rel[:-4]
-            dst = os.path.join(outdir, rel_no_ext)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            decompress_file(src, dst)
-            files_extracted.append(rel_no_ext)
-            status_bar(i, total, prefix="📤 Extracting")
+            with tarfile.open(tmp_tar,"r") as tar:
+                members=[m for m in tar.getmembers() if m.isreg() or m.isdir()]
+                total=len(members)
+                for i,m in enumerate(members,1):
+                    if check_abort(): raise KeyboardInterrupt
+                    tar.extract(m,path=outdir)
+                    if m.isreg(): files_extracted.append(m.name)
+                    status_bar(i,total,prefix="📤 Extracting")
+            os.remove(tmp_tar)
+        else:
+            zst_files=[]
+            for wr,_,fns in os.walk(commit_dir):
+                for fn in fns:
+                    if fn.endswith(".zst"): zst_files.append(os.path.join(wr,fn))
+            total=len(zst_files)
+            for i,src in enumerate(zst_files,1):
+                if check_abort(): raise KeyboardInterrupt
+                rel=os.path.relpath(src,commit_dir)[:-4]
+                dst=os.path.join(outdir,rel); os.makedirs(os.path.dirname(dst),exist_ok=True)
+                decompress_file(src,dst); files_extracted.append(rel)
+                status_bar(i,total,prefix="📤 Extracting")
 
-    print(f"✅ Dumped {len(files_extracted)} files into {outdir}")
-
-    if remove:
-        try:
-            shutil.rmtree(commit_dir)
-            index.pop(commit_hash, None)
-            save_index(root, index)
+        print(f"✅ Dumped {len(files_extracted)} files into {outdir}")
+        if remove:
+            shutil.rmtree(commit_dir); index.pop(commit_hash,None); save_index(root,index)
             print(f"🗑️ Removed stored commit {commit_hash}")
-        except Exception as e:
-            print(f"⚠️  Could not remove stored commit: {e}")
+    except KeyboardInterrupt:
+        print("\n❌ Aborted by user (q pressed). Partial dump may exist in", outdir)
 
 def list_commits(sort_field=None, desc=False):
     root = require_rack_root()
     index = load_index(root)
     if not index:
-        print("📭 Rack is empty!")
+        print("📥 Rack is empty!")
         return
     items = list(index.items())
 
